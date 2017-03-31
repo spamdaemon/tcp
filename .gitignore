@@ -1,0 +1,5 @@
+*.o
+bin/
+libs/
+obj/
+core
