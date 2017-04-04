@@ -1,9 +1,12 @@
+#define _GNU_SOURCE
+
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <ctype.h>
+#include <fcntl.h>
 
 /** Includes needed for the sockets */
 #include <netinet/in.h>
@@ -16,136 +19,11 @@
 
 static int verbose = 0;
 static const int INFO = 1;
-static const int TRACE = 2;
+static const int DEBUG = 2;
+static const int TRACE = 3;
 
 static const int SOCKET_TYPE = SOCK_STREAM;
 static const int SOCKET_PROTOCOL = IPPROTO_TCP;
-
-struct XferBufferStruct;
-typedef struct XferBufferStruct XferBuffer;
-
-typedef void (*XferBufferTransform)(XferBuffer* buf);
-
-typedef struct
-{
-   int headersize;
-   int haveMessage;
-   int (*tx)(int);
-} TransformState;
-
-struct XferBufferStruct
-{
-   int readfd;
-   int writefd;
-   int allowWrite;
-   int allowRead;
-   size_t writeMark;
-   size_t readMark;
-   size_t endMark;
-   size_t buffersize;
-   char* buffer;
-   XferBufferTransform transform;
-   void* transformData;
-};
-
-static XferBuffer* newTransferBuffer(int reader, int writer)
-{
-   XferBuffer* buf = (XferBuffer*) malloc(sizeof(XferBuffer));
-   buf->readfd = reader;
-   buf->writefd = writer;
-   buf->buffersize = 16 * 1024;
-   buf->buffer = malloc(buf->buffersize);
-   buf->allowWrite = 1;
-   buf->allowRead = 1;
-   buf->readMark = 0;
-   buf->writeMark = 0;
-   buf->endMark = buf->buffersize;
-   buf->transform = NULL;
-   buf->transformData = NULL;
-   return buf;
-}
-
-static void freeXferBuffer(XferBuffer* buf)
-{
-   if (buf != NULL) {
-      free(buf->buffer);
-      free(buf);
-   }
-}
-
-static void prepareXferBufferSelection(XferBuffer* buf, fd_set* readfds, fd_set* writefds)
-{
-   FD_CLR(buf->readfd, readfds);
-   if (buf->endMark > buf->readMark && buf->allowRead) {
-      FD_SET(buf->readfd, readfds);
-   }
-   FD_CLR(buf->writefd, writefds);
-   if (buf->endMark > buf->writeMark && buf->allowWrite) {
-      FD_SET(buf->writefd, writefds);
-   }
-}
-
-// fill the buffer by reading from the associated file descriptor
-// return the amount of data that can still be read to fill the buffer
-static ssize_t fillXferBuffer(XferBuffer* buf, fd_set* readfds)
-{
-   if (readfds == NULL || FD_ISSET(buf->readfd, readfds)) {
-      if (buf->readMark < buf->endMark && buf->allowRead) {
-         if (readfds != NULL) {
-            FD_CLR(buf->readfd, readfds);
-         }
-         ssize_t n = read(buf->readfd, buf->buffer + buf->readMark, buf->endMark - buf->readMark);
-         if (n > 0) {
-            if (verbose >= TRACE) {
-               fprintf(stderr, "Read %d bytes from %d\n", n, buf->readfd);
-            }
-            buf->readMark += n;
-         }
-         else if (n == 0) {
-            return -1;
-         }
-         else {
-            perror("Failed to fill transfer buffer");
-            return -1;
-         }
-      }
-   }
-   return buf->endMark - buf->readMark;
-}
-
-// empty the buffer by writing to the associated file descriptor
-// return the amount of data that can still be written before the readMark is reached.
-static ssize_t emptyXferBuffer(XferBuffer* buf, fd_set* writefds)
-{
-   if (writefds == NULL || FD_ISSET(buf->writefd, writefds)) {
-      if (buf->writeMark < buf->readMark && buf->allowWrite) {
-         if (writefds != NULL) {
-            FD_CLR(buf->writefd, writefds);
-         }
-         ssize_t n = write(buf->writefd, buf->buffer + buf->writeMark, buf->readMark - buf->writeMark);
-         if (n > 0) {
-            buf->writeMark += n;
-            if (verbose >= TRACE) {
-               fprintf(stderr, "Wrote %d bytes to %d\n", n, buf->writefd);
-            }
-            if (buf->writeMark == buf->readMark) {
-               // reset the buffer
-               buf->readMark = buf->writeMark = 0;
-               buf->endMark = buf->buffersize;
-               buf->allowRead = 1;
-            }
-         }
-         else if (n == 0) {
-            return -1;
-         }
-         else {
-            perror("Failed to empty transfer buffer");
-            return -1;
-         }
-      }
-   }
-   return buf->readMark - buf->writeMark;
-}
 
 typedef struct
 {
@@ -190,6 +68,8 @@ static SocketAddress* parse_address(const char* addressport)
    char* address = NULL;
    char* service = NULL;
    const char* separators = "/:";
+   struct addrinfo* addresses = NULL;
+   struct sockaddr* ip_addr = NULL;
 
    rawAddress = strdup(addressport);
    address = rawAddress;
@@ -227,8 +107,6 @@ static SocketAddress* parse_address(const char* addressport)
    struct addrinfo hints = {
    AI_ALL,
    AF_UNSPEC, SOCKET_TYPE, SOCKET_PROTOCOL };
-   struct addrinfo* addresses = NULL;
-   struct sockaddr* ip_addr = NULL;
 
    int error = getaddrinfo(address, service, &hints, &addresses);
 
@@ -313,6 +191,208 @@ static int set_SO_REUSEADDR(int s)
 {
    int value = 1;
    return setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &value, sizeof(value));
+}
+
+static int set_NonBlocking(int s)
+{
+   int flags = fcntl(s, F_GETFL);
+   if (flags < 0) {
+      return -1;
+   }
+   int status = fcntl(s, F_SETFL, flags | O_NONBLOCK);
+   return status;
+}
+
+struct XferBufferStruct;
+typedef struct XferBufferStruct XferBuffer;
+
+typedef void (*XferBufferTransform)(XferBuffer* buf);
+
+static int maxFD(int a, int b)
+{
+   return a < b ? b : a;
+}
+
+typedef struct
+{
+   int headersize;
+   int haveMessage;
+   int (*tx)(int);
+} TransformState;
+
+struct XferBufferStruct
+{
+   int readfd;
+   int writefd;
+   int allowWrite;
+   int allowRead;
+   size_t writeMark;
+   size_t readMark;
+   size_t endMark;
+   size_t buffersize;
+   char* buffer;
+   int is_pipe;
+   int pipe_fd[2];
+   XferBufferTransform transform;
+   void* transformData;
+};
+
+static XferBuffer* newTransferBuffer(int reader, int writer)
+{
+   XferBuffer* buf = (XferBuffer*) malloc(sizeof(XferBuffer));
+   buf->readfd = reader;
+   buf->writefd = writer;
+   buf->buffersize = 16 * 1024;
+   buf->buffer = malloc(buf->buffersize);
+   buf->allowWrite = 1;
+   buf->allowRead = 1;
+   buf->readMark = 0;
+   buf->writeMark = 0;
+   buf->endMark = buf->buffersize;
+   buf->is_pipe = 0;
+   buf->pipe_fd[0] = buf->pipe_fd[1] = -1;
+   buf->transform = NULL;
+   buf->transformData = NULL;
+   return buf;
+}
+
+static void freeXferBuffer(XferBuffer* buf)
+{
+   if (buf != NULL) {
+      if (buf->pipe_fd[0] >= 0) {
+         close(buf->pipe_fd[0]);
+      }
+      if (buf->pipe_fd[1] >= 0) {
+         close(buf->pipe_fd[1]);
+      }
+      free(buf->buffer);
+      free(buf);
+   }
+}
+
+static int prepareXferBufferSelection(XferBuffer* buf, fd_set* readfds, fd_set* writefds)
+{
+   if (buf->transform == NULL) {
+      buf->is_pipe = 1;
+   }
+   if (buf->is_pipe) {
+
+      if (buf->pipe_fd[0] == buf->pipe_fd[1]) {
+         // create a pipe on the fly
+         if (pipe(buf->pipe_fd) < 0) {
+            perror("Failed to a create pipe");
+            return 0;
+         }
+         set_NonBlocking(buf->pipe_fd[0]);
+         set_NonBlocking(buf->pipe_fd[1]);
+      }
+
+      FD_SET(buf->readfd, readfds);
+      FD_SET(buf->pipe_fd[0], readfds);
+      FD_SET(buf->writefd, writefds);
+      FD_SET(buf->pipe_fd[1], writefds);
+   }
+   else {
+      FD_CLR(buf->readfd, readfds);
+      if (buf->endMark > buf->readMark && buf->allowRead) {
+         FD_SET(buf->readfd, readfds);
+      }
+      FD_CLR(buf->writefd, writefds);
+      if (buf->endMark > buf->writeMark && buf->allowWrite) {
+         FD_SET(buf->writefd, writefds);
+      }
+   }
+   return -1;
+}
+
+// fill the buffer by reading from the associated file descriptor
+// return the amount of data that can still be read to fill the buffer
+static ssize_t fillXferBuffer(XferBuffer* buf, fd_set* readfds)
+{
+   if (readfds == NULL || FD_ISSET(buf->readfd, readfds)) {
+      if (buf->readMark < buf->endMark && buf->allowRead) {
+         if (readfds != NULL) {
+            FD_CLR(buf->readfd, readfds);
+         }
+         ssize_t n = 0;
+         if (buf->is_pipe) {
+            n = splice(buf->readfd, NULL, buf->pipe_fd[1], NULL, 16 * 1024, SPLICE_F_NONBLOCK);
+            if (n > 0) {
+               // the buffer is full
+               buf->readMark = 0;
+               buf->endMark = n;
+            }
+         }
+         else {
+            n = read(buf->readfd, buf->buffer + buf->readMark, buf->endMark - buf->readMark);
+         }
+         if (n > 0) {
+            if (verbose >= TRACE) {
+               if (buf->is_pipe) {
+                  fprintf(stderr, "Spliced %d bytes from %d\n", n, buf->readfd);
+               }
+               else {
+                  fprintf(stderr, "Read %d bytes from %d\n", n, buf->readfd);
+               }
+            }
+            buf->readMark += n;
+         }
+         else if (n == 0) {
+            return -1;
+         }
+         else {
+            perror("Failed to fill transfer buffer");
+            return -1;
+         }
+      }
+   }
+   return buf->endMark - buf->readMark;
+}
+
+// empty the buffer by writing to the associated file descriptor
+// return the amount of data that can still be written before the readMark is reached.
+static ssize_t emptyXferBuffer(XferBuffer* buf, fd_set* writefds)
+{
+   if (writefds == NULL || FD_ISSET(buf->writefd, writefds)) {
+      if (buf->writeMark < buf->readMark && buf->allowWrite) {
+         if (writefds != NULL) {
+            FD_CLR(buf->writefd, writefds);
+         }
+         ssize_t n = 0;
+         if (buf->is_pipe) {
+            n = splice(buf->pipe_fd[0], NULL, buf->writefd, NULL, buf->readMark - buf->writeMark, SPLICE_F_NONBLOCK);
+
+         }
+         else {
+            n = write(buf->writefd, buf->buffer + buf->writeMark, buf->readMark - buf->writeMark);
+         }
+         if (n > 0) {
+            buf->writeMark += n;
+            if (verbose >= TRACE) {
+               if (buf->is_pipe) {
+                  fprintf(stderr, "Spliced %d bytes to %d\n", n, buf->writefd);
+               }
+               else {
+                  fprintf(stderr, "Wrote %d bytes to %d\n", n, buf->writefd);
+               }
+            }
+            if (buf->writeMark == buf->readMark) {
+               // reset the buffer
+               buf->readMark = buf->writeMark = 0;
+               buf->endMark = buf->buffersize;
+               buf->allowRead = 1;
+            }
+         }
+         else if (n == 0) {
+            return -1;
+         }
+         else {
+            perror("Failed to empty transfer buffer");
+            return -1;
+         }
+      }
+   }
+   return buf->readMark - buf->writeMark;
 }
 
 static void usage(int argc, char* const * argv)
@@ -460,11 +540,7 @@ int main(int argc, char* const * argv)
    FD_ZERO(readfds);
    FD_ZERO(writefds);
    FD_ZERO(errorfds);
-   int nfds = client;
-   if (dest > nfds) {
-      nfds = dest;
-   }
-   nfds += 1;
+   int nfds = maxFD(client, dest);
 
    inbound = newTransferBuffer(dest, client);
    outbound = newTransferBuffer(client, dest);
@@ -473,18 +549,10 @@ int main(int argc, char* const * argv)
     * Set your own transforms here
     */
    TransformState istate;
-   istate.headersize = 8;
+   istate.headersize = 1;
    istate.tx = toupper;
    inbound->transform = transformXferBuffer;
    inbound->transformData = &istate;
-
-   if (0) {
-      TransformState ostate;
-      ostate.headersize = 8;
-      ostate.tx = tolower;
-      outbound->transform = transformXferBuffer;
-      outbound->transformData = &ostate;
-   }
 
    if (inbound->transform != NULL) {
       inbound->transform(inbound);
@@ -493,12 +561,28 @@ int main(int argc, char* const * argv)
       outbound->transform(outbound);
    }
 
+   if (set_NonBlocking(client) < 0) {
+      errorMessage = "Failed to make destination socket non-blocking";
+   }
+
+   if (set_NonBlocking(dest) < 0) {
+      errorMessage = "Failed to make destination socket non-blocking";
+   }
+
    for (;;) {
       prepareXferBufferSelection(inbound, readfds, writefds);
       prepareXferBufferSelection(outbound, readfds, writefds);
+      if (inbound->is_pipe) {
+         nfds = maxFD(nfds, inbound->pipe_fd[0]);
+         nfds = maxFD(nfds, inbound->pipe_fd[1]);
+      }
+      if (outbound->is_pipe) {
+         nfds = maxFD(nfds, outbound->pipe_fd[0]);
+         nfds = maxFD(nfds, outbound->pipe_fd[1]);
+      }
       FD_SET(client, errorfds);
       FD_SET(dest, errorfds);
-      int status = select(nfds, readfds, writefds, errorfds, NULL);
+      int status = select(nfds + 1, readfds, writefds, errorfds, NULL);
       if (status < 0) {
          perror("Failed to send message");
          errorMessage = "Select failed";
